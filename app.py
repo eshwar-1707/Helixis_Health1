@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify
 import requests
+import os
 from collections import defaultdict, deque
-from deep_translator import GoogleTranslator  # NEW
+from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 
@@ -13,7 +14,6 @@ GEMINI_API_KEY = "AIzaSyB7JCayaGoE0MbVCv5Bv3r4E74hww1mjf0"
 
 # ====== MEMORY ======
 user_conversations = defaultdict(lambda: deque(maxlen=20))
-user_languages = defaultdict(lambda: "en")  # Track user’s preferred language
 
 # ====== SYSTEM PROMPT ======
 SYSTEM_PROMPT = (
@@ -24,9 +24,8 @@ SYSTEM_PROMPT = (
     "Keep your answers concise, clear, and professional."
 )
 
-# ====== WHATSAPP VERIFY WEBHOOK ======
 
-
+# ====== VERIFY WEBHOOK ======
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -38,9 +37,8 @@ def verify_webhook():
     else:
         return "Verification failed", 403
 
+
 # ====== RECEIVE & PROCESS MESSAGES ======
-
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -49,55 +47,59 @@ def webhook():
         sender_id = entry["from"]
         user_message = entry["text"]["body"]
 
-        # Detect language
-        detected_lang = GoogleTranslator().detect(user_message)
-        user_languages[sender_id] = detected_lang
-
         # Reset memory if user types "reset"
         if user_message.lower().strip() == "reset":
             user_conversations[sender_id].clear()
             send_message(sender_id, "✅ Memory cleared. Let's start fresh.")
             return "OK", 200
 
-        # Translate to English for Gemini
-        translated_input = (
-            GoogleTranslator(source=detected_lang,
-                             target="en").translate(user_message)
-            if detected_lang != "en"
-            else user_message
-        )
+        # Detect + translate user input into English
+        try:
+            user_message_en = GoogleTranslator(
+                source="auto", target="en").translate(user_message)
+            detected_lang = GoogleTranslator(
+                source="auto", target="en").source  # auto-detected language
+        except Exception as e:
+            print("Translation error:", e)
+            user_message_en = user_message
+            detected_lang = "en"
 
+        # Append user message (in English) to history
         user_conversations[sender_id].append(
-            {"role": "user", "content": translated_input})
+            {"role": "user", "content": user_message_en})
 
-        # Build conversation
+        # Build conversation with system + history
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(list(user_conversations[sender_id]))
 
-        # Get Gemini reply
-        reply = get_gemini_response(messages)
+        # Get Gemini response (in English)
+        reply_en = get_gemini_response(messages)
 
-        # Translate back to user’s language
-        final_reply = (
-            GoogleTranslator(
-                source="en", target=detected_lang).translate(reply)
-            if detected_lang != "en"
-            else reply
-        )
-
-        # Save & send
+        # Append assistant reply to history
         user_conversations[sender_id].append(
-            {"role": "assistant", "content": reply})
-        send_message(sender_id, final_reply)
+            {"role": "assistant", "content": reply_en})
+
+        # Translate Gemini reply back to user’s language
+        if detected_lang != "en":
+            try:
+                reply_user_lang = GoogleTranslator(
+                    source="en", target=detected_lang).translate(reply_en)
+            except Exception as e:
+                print("Back-translation error:", e)
+                reply_user_lang = reply_en
+        else:
+            reply_user_lang = reply_en
+
+        # Send back to WhatsApp
+        send_message(sender_id, reply_user_lang)
 
     except Exception as e:
         print("❌ Error handling message:", e)
 
     return "OK", 200
 
+
 # ====== GEMINI CALL ======
-
-
 def get_gemini_response(messages):
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
@@ -105,10 +107,13 @@ def get_gemini_response(messages):
 
     contents = []
     for msg in messages:
-        if msg["role"] == "system" or msg["role"] == "user":
+        if msg["role"] == "system":
             contents.append({"role": "user", "parts": [
                             {"text": msg["content"]}]})
-        else:
+        elif msg["role"] == "user":
+            contents.append({"role": "user", "parts": [
+                            {"text": msg["content"]}]})
+        else:  # assistant
             contents.append({"role": "model", "parts": [
                             {"text": msg["content"]}]})
 
@@ -120,12 +125,11 @@ def get_gemini_response(messages):
     try:
         return resp_json["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print("❌ Gemini API error:", e)
+        print("❌ Gemini API error:", e, resp_json)
         return "⚠ Sorry, I couldn’t process that."
 
+
 # ====== SEND MESSAGE TO WHATSAPP ======
-
-
 def send_message(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -140,17 +144,15 @@ def send_message(to, text):
     }
     requests.post(url, headers=headers, json=payload)
 
+
 # ====== DEBUG STATUS ======
-
-
 @app.route("/status", methods=["GET"])
 def status():
     result = {}
     for user_id, history in user_conversations.items():
         result[user_id] = {
             "messages_stored": len(history),
-            "last_message": history[-1]["content"] if history else "No messages yet",
-            "preferred_language": user_languages[user_id]
+            "last_message": history[-1]["content"] if history else "No messages yet"
         }
     return jsonify(result)
 
