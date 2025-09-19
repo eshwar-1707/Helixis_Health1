@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import requests
-import os
 from collections import defaultdict, deque
+from deep_translator import GoogleTranslator  # NEW
 
 app = Flask(__name__)
 
@@ -12,8 +12,8 @@ PHONE_NUMBER_ID = "822103324313430"
 GEMINI_API_KEY = "AIzaSyB7JCayaGoE0MbVCv5Bv3r4E74hww1mjf0"
 
 # ====== MEMORY ======
-# Each user_id stores a deque (FIFO queue) of last 20 messages
 user_conversations = defaultdict(lambda: deque(maxlen=20))
+user_languages = defaultdict(lambda: "en")  # Track user’s preferred language
 
 # ====== SYSTEM PROMPT ======
 SYSTEM_PROMPT = (
@@ -46,8 +46,12 @@ def webhook():
     data = request.get_json()
     try:
         entry = data["entry"][0]["changes"][0]["value"]["messages"][0]
-        sender_id = entry["from"]  # phone number of sender
+        sender_id = entry["from"]
         user_message = entry["text"]["body"]
+
+        # Detect language
+        detected_lang = GoogleTranslator().detect(user_message)
+        user_languages[sender_id] = detected_lang
 
         # Reset memory if user types "reset"
         if user_message.lower().strip() == "reset":
@@ -55,23 +59,36 @@ def webhook():
             send_message(sender_id, "✅ Memory cleared. Let's start fresh.")
             return "OK", 200
 
-        # Append user message to history
-        user_conversations[sender_id].append(
-            {"role": "user", "content": user_message})
+        # Translate to English for Gemini
+        translated_input = (
+            GoogleTranslator(source=detected_lang,
+                             target="en").translate(user_message)
+            if detected_lang != "en"
+            else user_message
+        )
 
-        # Build conversation with system + history
+        user_conversations[sender_id].append(
+            {"role": "user", "content": translated_input})
+
+        # Build conversation
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(list(user_conversations[sender_id]))
 
-        # Call Gemini API
+        # Get Gemini reply
         reply = get_gemini_response(messages)
 
-        # Append assistant reply to history
+        # Translate back to user’s language
+        final_reply = (
+            GoogleTranslator(
+                source="en", target=detected_lang).translate(reply)
+            if detected_lang != "en"
+            else reply
+        )
+
+        # Save & send
         user_conversations[sender_id].append(
             {"role": "assistant", "content": reply})
-
-        # Send back to WhatsApp
-        send_message(sender_id, reply)
+        send_message(sender_id, final_reply)
 
     except Exception as e:
         print("❌ Error handling message:", e)
@@ -82,21 +99,16 @@ def webhook():
 
 
 def get_gemini_response(messages):
-    import requests
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
 
-    # Convert messages into prompt format
     contents = []
     for msg in messages:
-        if msg["role"] == "system":
+        if msg["role"] == "system" or msg["role"] == "user":
             contents.append({"role": "user", "parts": [
                             {"text": msg["content"]}]})
-        elif msg["role"] == "user":
-            contents.append({"role": "user", "parts": [
-                            {"text": msg["content"]}]})
-        else:  # assistant
+        else:
             contents.append({"role": "model", "parts": [
                             {"text": msg["content"]}]})
 
@@ -128,7 +140,7 @@ def send_message(to, text):
     }
     requests.post(url, headers=headers, json=payload)
 
-# ====== DEBUG STATUS ROUTE ======
+# ====== DEBUG STATUS ======
 
 
 @app.route("/status", methods=["GET"])
@@ -137,7 +149,8 @@ def status():
     for user_id, history in user_conversations.items():
         result[user_id] = {
             "messages_stored": len(history),
-            "last_message": history[-1]["content"] if history else "No messages yet"
+            "last_message": history[-1]["content"] if history else "No messages yet",
+            "preferred_language": user_languages[user_id]
         }
     return jsonify(result)
 
