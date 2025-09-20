@@ -9,7 +9,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = "hackathon2025"   # your verify token
 WHATSAPP_TOKEN = "EAAg0NTccUccBPdNB6DcgyonLIDeObqadZAaOKbMYEsZCoxSfsQV8CG6tf0ZBncZCg0MirPYZAcK3CKubOLG10ZAPO1SKsZBa6H6JpBJTQdL92GTxy7y36jxTOWYAYEfE81lPhshrJCDYgPlMnhSO7HV4IBuuUxfJRgBazeBYc5pBV6PHiI9HzIGlIf0aD05"
 PHONE_NUMBER_ID = "822103324313430"
-GEMINI_API_KEY = "AIzaSyB7JCayaGoE0MbVCv5Bv3r4E74hww1mjf0"
+GEMINI_API_KEY = "AIzaSyCEe0w0YwiQ9pviwjMFPIsrpEeQjE1ArI4"
 
 # ====== MEMORY ======
 user_conversations = defaultdict(lambda: deque(maxlen=20))
