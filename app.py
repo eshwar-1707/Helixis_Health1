@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import requests
-import os
 from collections import defaultdict, deque
+from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 
@@ -12,7 +12,6 @@ PHONE_NUMBER_ID = "822103324313430"
 GEMINI_API_KEY = "AIzaSyB7JCayaGoE0MbVCv5Bv3r4E74hww1mjf0"
 
 # ====== MEMORY ======
-# Each user_id stores a deque (FIFO queue) of last 20 messages
 user_conversations = defaultdict(lambda: deque(maxlen=20))
 
 # ====== SYSTEM PROMPT ======
@@ -44,34 +43,47 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
+
     try:
-        entry = data["entry"][0]["changes"][0]["value"]["messages"][0]
-        sender_id = entry["from"]  # phone number of sender
+        change_val = data["entry"][0]["changes"][0]["value"]
+
+        # ✅ Check if this event actually has "messages"
+        if "messages" not in change_val:
+            return "No user message event", 200
+
+        entry = change_val["messages"][0]
+        sender_id = entry["from"]  # phone number
         user_message = entry["text"]["body"]
 
-        # Reset memory if user types "reset"
+        # Reset memory
         if user_message.lower().strip() == "reset":
             user_conversations[sender_id].clear()
             send_message(sender_id, "✅ Memory cleared. Let's start fresh.")
             return "OK", 200
 
-        # Append user message to history
+        # Detect language & translate to English
+        detected_lang = GoogleTranslator(
+            source="auto", target="en").translate(user_message)
         user_conversations[sender_id].append(
-            {"role": "user", "content": user_message})
+            {"role": "user", "content": detected_lang})
 
         # Build conversation with system + history
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(list(user_conversations[sender_id]))
 
-        # Call Gemini API
-        reply = get_gemini_response(messages)
+        # Call Gemini
+        reply_en = get_gemini_response(messages)
 
-        # Append assistant reply to history
+        # Translate back to original language
+        reply_final = GoogleTranslator(
+            source="en", target="auto").translate(reply_en)
+
+        # Append assistant reply
         user_conversations[sender_id].append(
-            {"role": "assistant", "content": reply})
+            {"role": "assistant", "content": reply_en})
 
-        # Send back to WhatsApp
-        send_message(sender_id, reply)
+        # Send to WhatsApp
+        send_message(sender_id, reply_final)
 
     except Exception as e:
         print("❌ Error handling message:", e)
@@ -82,34 +94,34 @@ def webhook():
 
 
 def get_gemini_response(messages):
-    import requests
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
 
-    # Convert messages into prompt format
     contents = []
     for msg in messages:
-        if msg["role"] == "system":
-            contents.append({"role": "user", "parts": [
-                            {"text": msg["content"]}]})
-        elif msg["role"] == "user":
-            contents.append({"role": "user", "parts": [
-                            {"text": msg["content"]}]})
-        else:  # assistant
-            contents.append({"role": "model", "parts": [
-                            {"text": msg["content"]}]})
-
+        role = "user" if msg["role"] != "assistant" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
     payload = {"contents": contents}
 
-    resp = requests.post(url, headers=headers, params=params, json=payload)
-    resp_json = resp.json()
-
     try:
+        resp = requests.post(url, headers=headers,
+                             params=params, json=payload, timeout=15)
+        resp_json = resp.json()
         return resp_json["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print("❌ Gemini API error:", e)
-        return "⚠ Sorry, I couldn’t process that."
+        print("First Gemini error:", e)
+        print("Raw response:", resp.text if 'resp' in locals() else None)
+        # Retry once
+        try:
+            resp = requests.post(url, headers=headers,
+                                 params=params, json=payload, timeout=15)
+            resp_json = resp.json()
+            return resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e2:
+            print("Retry Gemini error:", e2)
+            print("Raw retry response:", resp.text if 'resp' in locals() else None)
+            return "⚠ Sorry, I couldn’t process that."
 
 # ====== SEND MESSAGE TO WHATSAPP ======
 
